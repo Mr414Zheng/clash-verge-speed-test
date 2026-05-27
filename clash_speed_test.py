@@ -12,10 +12,13 @@ Usage:
 
 import argparse
 import sys
+import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from queue import Empty, Queue
+from typing import Callable, Iterator
 from urllib.parse import urlparse
 
 import requests
@@ -43,6 +46,7 @@ FALLBACK_SPEED_URLS = [
 ]
 DEFAULT_TIMEOUT = 10  # seconds
 DEFAULT_SPEED_TIMEOUT = 15  # seconds per speed-test download attempt
+DEFAULT_SPEED_DURATION = 5  # seconds to read bytes for each speed-test attempt
 DEFAULT_LATENCY_TIMEOUT = 5000  # ms (Clash API expects milliseconds)
 DEFAULT_WORKERS = 3
 # Common mixed-port / port values to probe when the API does not expose it.
@@ -209,17 +213,70 @@ class ClashClient:
     def _download_and_measure(self, url: str, proxies: dict) -> float:
         """Download *url* through the given *proxies* dict; return Mbps."""
         start = time.monotonic()
-        resp = requests.get(
-            url,
-            proxies=proxies,
-            timeout=DEFAULT_SPEED_TIMEOUT,
-            stream=True,
-        )
-        resp.raise_for_status()
-        total_bytes = 0
-        for chunk in resp.iter_content(chunk_size=65536):
-            total_bytes += len(chunk)
-        elapsed = time.monotonic() - start
+        state: dict[str, object] = {
+            "total_bytes": 0,
+            "error": None,
+            "resp": None,
+            "finished": False,
+        }
+        state_lock = threading.Lock()
+        stop_download = threading.Event()
+
+        def _download_worker() -> None:
+            resp: requests.Response | None = None
+            try:
+                resp = requests.get(
+                    url,
+                    proxies=proxies,
+                    timeout=min(DEFAULT_SPEED_TIMEOUT, DEFAULT_SPEED_DURATION),
+                    stream=True,
+                )
+                with state_lock:
+                    state["resp"] = resp
+                resp.raise_for_status()
+                for chunk in resp.iter_content(chunk_size=1024):
+                    if stop_download.is_set():
+                        break
+                    if not chunk:
+                        continue
+                    with state_lock:
+                        state["total_bytes"] = int(state["total_bytes"]) + len(chunk)
+            except Exception as exc:
+                with state_lock:
+                    state["error"] = exc
+            finally:
+                if resp is not None:
+                    resp.close()
+                with state_lock:
+                    state["finished"] = True
+
+        worker = threading.Thread(target=_download_worker, daemon=True)
+        worker.start()
+        worker.join(DEFAULT_SPEED_DURATION)
+
+        with state_lock:
+            total_bytes = int(state["total_bytes"])
+            error = state["error"]
+            resp = state["resp"]
+            finished = bool(state["finished"])
+
+        if not finished:
+            stop_download.set()
+            if resp is not None:
+                threading.Thread(target=resp.close, daemon=True).start()
+            if total_bytes == 0:
+                raise requests.Timeout(
+                    f"speed test timed out before receiving body bytes after "
+                    f"{DEFAULT_SPEED_DURATION} seconds"
+                )
+
+        if total_bytes == 0 and error is not None:
+            raise error  # type: ignore[misc]
+
+        if total_bytes == 0:
+            raise ValueError("speed test URL returned no body bytes")
+
+        elapsed = min(time.monotonic() - start, DEFAULT_SPEED_DURATION)
         if elapsed == 0:
             elapsed = 0.001
         mbps = (total_bytes * 8) / (elapsed * 1_000_000)  # megabits per second
@@ -239,6 +296,69 @@ class ClashClient:
 # ---------------------------------------------------------------------------
 # Speed test runner
 # ---------------------------------------------------------------------------
+StopChecker = Callable[[], bool]
+
+
+def _is_stop_requested(stop_requested: StopChecker | None) -> bool:
+    return bool(stop_requested and stop_requested())
+
+
+def iter_latency_tests(
+    client: ClashClient,
+    proxies: list[tuple[str, str]],
+    latency_url: str,
+    workers: int = 1,
+    stop_requested: StopChecker | None = None,
+) -> Iterator[tuple[str, tuple[int | None, str | None]]]:
+    """Yield latency results as each proxy finishes.
+
+    The optional *stop_requested* callback prevents new queued tests from being
+    submitted. Already-running requests are allowed to finish so partial results
+    remain valid.
+    """
+
+    def _test_one(name: str) -> tuple[str, tuple[int | None, str | None]]:
+        try:
+            delay = client.test_latency(name, url=latency_url)
+            return name, (delay, None)
+        except Exception as exc:
+            return name, (None, f"latency error: {exc}")
+
+    if workers <= 1:
+        for _group, name in proxies:
+            if _is_stop_requested(stop_requested):
+                break
+            yield _test_one(name)
+        return
+
+    proxy_iter = iter(proxies)
+    max_workers = max(1, workers)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+
+        def _submit_next() -> bool:
+            if _is_stop_requested(stop_requested):
+                return False
+            try:
+                _group, next_name = next(proxy_iter)
+            except StopIteration:
+                return False
+            futures[pool.submit(_test_one, next_name)] = next_name
+            return True
+
+        for _ in range(min(max_workers, len(proxies))):
+            if not _submit_next():
+                break
+
+        while futures:
+            done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                futures.pop(future, None)
+                yield future.result()
+                if not _is_stop_requested(stop_requested):
+                    _submit_next()
+
+
 def run_latency_tests(
     client: ClashClient,
     proxies: list[tuple[str, str]],
@@ -252,25 +372,61 @@ def run_latency_tests(
     Returns {proxy_name: (latency_ms_or_None, error_or_None)}.
     """
     results: dict[str, tuple[int | None, str | None]] = {}
-
-    def _test_one(name: str) -> tuple[str, tuple[int | None, str | None]]:
-        try:
-            delay = client.test_latency(name, url=latency_url)
-            return name, (delay, None)
-        except Exception as exc:
-            return name, (None, f"latency error: {exc}")
-
-    if workers <= 1:
-        for _group, name in proxies:
-            results[name] = _test_one(name)[1]
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_test_one, name): name for _, name in proxies}
-            for future in as_completed(futures):
-                name, result = future.result()
-                results[name] = result
+    for name, result in iter_latency_tests(client, proxies, latency_url, workers):
+        results[name] = result
 
     return results
+
+
+def iter_speed_tests(
+    client: ClashClient,
+    proxies: list[tuple[str, str]],
+    speed_url: str,
+    workers: int,
+    stop_requested: StopChecker | None = None,
+) -> Iterator[tuple[str, tuple[float | None, str | None]]]:
+    """Yield speed results as each proxy finishes.
+
+    Proxies in the same group still run sequentially because selecting a proxy
+    mutates group state. Groups run concurrently up to *workers* threads.
+    """
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for group, name in proxies:
+        grouped[group].append(name)
+
+    result_queue: Queue[tuple[str, tuple[float | None, str | None]]] = Queue()
+
+    def _test_group(group: str, names: list[str]) -> None:
+        for name in names:
+            if _is_stop_requested(stop_requested):
+                break
+            try:
+                client.select_proxy(group, name)
+                speed = client.test_download_speed(name, speed_url)
+                result_queue.put((name, (speed, None)))
+            except Exception as exc:
+                result_queue.put((name, (None, f"speed error: {exc}")))
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(_test_group, group, names) for group, names in grouped.items()]
+        pending = set(futures)
+
+        while pending:
+            try:
+                yield result_queue.get(timeout=0.1)
+            except Empty:
+                pass
+
+            done = {future for future in pending if future.done()}
+            for future in done:
+                pending.remove(future)
+                future.result()
+
+        while True:
+            try:
+                yield result_queue.get_nowait()
+            except Empty:
+                break
 
 
 def run_speed_tests(
@@ -287,34 +443,9 @@ def run_speed_tests(
 
     Returns {proxy_name: (speed_mbps_or_None, error_or_None)}.
     """
-    # Group proxies by group name so each group is tested serially
-    grouped: dict[str, list[str]] = defaultdict(list)
-    for group, name in proxies:
-        grouped[group].append(name)
-
     results: dict[str, tuple[float | None, str | None]] = {}
-
-    def _test_group(
-        group: str, names: list[str]
-    ) -> list[tuple[str, tuple[float | None, str | None]]]:
-        """Test all proxies in *group* one at a time."""
-        group_results: list[tuple[str, tuple[float | None, str | None]]] = []
-        for name in names:
-            try:
-                client.select_proxy(group, name)
-                speed = client.test_download_speed(name, speed_url)
-                group_results.append((name, (speed, None)))
-            except Exception as exc:
-                group_results.append((name, (None, f"speed error: {exc}")))
-        return group_results
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_test_group, g, n): g for g, n in grouped.items()
-        }
-        for future in as_completed(futures):
-            for name, result in future.result():
-                results[name] = result
+    for name, result in iter_speed_tests(client, proxies, speed_url, workers):
+        results[name] = result
     return results
 
 

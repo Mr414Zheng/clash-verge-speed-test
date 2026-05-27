@@ -10,7 +10,6 @@ import os
 import io
 import csv
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 
@@ -21,8 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from clash_speed_test import (
     ClashClient,
     NodeResult,
-    run_latency_tests,
-    run_speed_tests,
+    iter_latency_tests,
+    iter_speed_tests,
     DEFAULT_API_URL,
     DEFAULT_LATENCY_URL,
     DEFAULT_SPEED_URL,
@@ -126,6 +125,52 @@ def results_to_csv(results: list[NodeResult]) -> str:
     return buf.getvalue()
 
 
+def sort_results(results: list[NodeResult], sort_key: str) -> list[NodeResult]:
+    """Return a sorted copy of the current result rows."""
+    sorted_results = list(results)
+    if sort_key == "speed":
+        sorted_results.sort(key=lambda r: (r.speed_mbps is None, -(r.speed_mbps or 0)))
+    else:
+        sorted_results.sort(key=lambda r: (r.latency_ms is None, r.latency_ms or 999_999))
+    return sorted_results
+
+
+def build_display_data(results: list[NodeResult]) -> list[dict]:
+    """Build dataframe rows from NodeResult objects."""
+    display_data = []
+    for idx, r in enumerate(results, 1):
+        display_data.append({
+            "序号": idx,
+            "节点名称": r.name,
+            "代理组": r.group,
+            "延迟 (ms)": r.latency_ms if r.latency_ms is not None else None,
+            "速度 (Mbps)": r.speed_mbps if r.speed_mbps is not None else None,
+            "错误信息": r.error or "",
+        })
+    return display_data
+
+
+def show_results_dataframe(results: list[NodeResult]) -> None:
+    """Render the shared result table."""
+    st.dataframe(
+        build_display_data(results),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "序号": st.column_config.NumberColumn("序号", width="small"),
+            "节点名称": st.column_config.TextColumn("节点名称", width="medium"),
+            "代理组": st.column_config.TextColumn("代理组", width="medium"),
+            "延迟 (ms)": st.column_config.NumberColumn(
+                "延迟 (ms)", format="%d", width="small"
+            ),
+            "速度 (Mbps)": st.column_config.NumberColumn(
+                "速度 (Mbps)", format="%.2f", width="small"
+            ),
+            "错误信息": st.column_config.TextColumn("错误信息", width="large"),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main page
 # ---------------------------------------------------------------------------
@@ -139,11 +184,13 @@ if "test_running" not in st.session_state:
     st.session_state["test_running"] = False
 if "test_mode" not in st.session_state:
     st.session_state["test_mode"] = None
+if "stop_requested" not in st.session_state:
+    st.session_state["stop_requested"] = False
 
 # ---------------------------------------------------------------------------
 # Start Test button
 # ---------------------------------------------------------------------------
-latency_col, speed_col, status_col = st.columns([1, 1, 2])
+latency_col, speed_col, stop_col, status_col = st.columns([1, 1, 1, 2])
 
 with latency_col:
     latency_clicked = st.button(
@@ -159,6 +206,19 @@ with speed_col:
         use_container_width=True,
     )
 
+with stop_col:
+    stop_clicked = st.button(
+        "停止测试",
+        disabled=not st.session_state["test_running"],
+        use_container_width=True,
+    )
+
+
+if stop_clicked:
+    st.session_state["stop_requested"] = True
+    st.session_state["test_running"] = False
+    st.session_state["test_mode"] = None
+    st.warning("已请求停止测试，已完成的节点结果会保留。")
 
 if latency_clicked or speed_clicked:
     # --- Validation ---
@@ -181,7 +241,8 @@ if latency_clicked or speed_clicked:
 
     st.session_state["test_running"] = True
     st.session_state["test_mode"] = "latency" if latency_clicked else "speed"
-    st.session_state["results"] = None
+    st.session_state["stop_requested"] = False
+    st.session_state["results"] = []
     st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -237,26 +298,50 @@ if st.session_state["test_running"]:
             st.stop()
 
         total_nodes = len(proxies)
-        latency_map: dict[str, tuple[int | None, str | None]] = {}
-        speed_map: dict[str, tuple[float | None, str | None]] = {}
+        result_by_name: dict[str, NodeResult] = {}
+        group_by_name = {name: group for group, name in proxies}
+        completed = 0
+        live_results = st.empty()
+
+        def _publish_result(name: str, result, mode: str) -> None:
+            node = result_by_name.get(name) or NodeResult(
+                name=name,
+                group=group_by_name.get(name, ""),
+            )
+            value, error = result
+            if mode == "latency":
+                node.latency_ms = value
+                if error:
+                    node.error = error
+            else:
+                node.speed_mbps = value
+                if error:
+                    node.error = error
+            result_by_name[name] = node
+
+            current_results = sort_results(list(result_by_name.values()), sort_by)
+            if mode == "speed":
+                current_results = sort_results(current_results, "speed")
+            st.session_state["results"] = current_results
+            live_results.dataframe(
+                build_display_data(current_results),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         if test_mode == "latency":
             progress_bar.progress(5, text=f"找到 {total_nodes} 个代理节点，开始延迟测试...")
-
-            def _test_latency(name):
-                try:
-                    delay = client.test_latency(name, url=effective_latency_url)
-                    return name, (delay, None)
-                except Exception as exc:
-                    return name, (None, f"延迟测试失败: {exc}")
-
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(_test_latency, name): name for _, name in proxies}
-                for i, future in enumerate(as_completed(futures), 1):
-                    name, result = future.result()
-                    latency_map[name] = result
-                    pct = 5 + int((i / total_nodes) * 90)
-                    progress_bar.progress(pct, text=f"延迟测试中 ({i}/{total_nodes}): {name}")
+            for name, result in iter_latency_tests(
+                client,
+                proxies,
+                effective_latency_url,
+                workers,
+                stop_requested=lambda: st.session_state.get("stop_requested", False),
+            ):
+                completed += 1
+                _publish_result(name, result, "latency")
+                pct = 5 + int((completed / total_nodes) * 90)
+                progress_bar.progress(pct, text=f"延迟测试中 ({completed}/{total_nodes}): {name}")
         else:
             progress_bar.progress(
                 5,
@@ -265,44 +350,26 @@ if st.session_state["test_running"]:
                     f"(代理端口 {proxy_port})..."
                 ),
             )
-            speed_map = run_speed_tests(client, proxies, effective_speed_url, workers)
-            progress_bar.progress(95, text="测速完成，整理结果...")
+            for name, result in iter_speed_tests(
+                client,
+                proxies,
+                effective_speed_url,
+                workers,
+                stop_requested=lambda: st.session_state.get("stop_requested", False),
+            ):
+                completed += 1
+                _publish_result(name, result, "speed")
+                pct = 5 + int((completed / total_nodes) * 90)
+                progress_bar.progress(pct, text=f"网速测试中 ({completed}/{total_nodes}): {name}")
 
-        # Step 4: Build NodeResult list
-        results: list[NodeResult] = []
-        for group, name in proxies:
-            lat, lat_err = latency_map.get(name, (None, None))
-            spd, spd_err = speed_map.get(name, (None, None))
-
-            errors: list[str] = []
-            if lat_err:
-                errors.append(lat_err)
-            if spd_err:
-                errors.append(spd_err)
-
-            results.append(
-                NodeResult(
-                    name=name,
-                    group=group,
-                    latency_ms=lat,
-                    speed_mbps=spd,
-                    error="; ".join(errors) if errors else None,
-                )
-            )
-
-        # Sort
-        effective_sort = sort_by
-        if test_mode == "speed" and not any(r.latency_ms is not None for r in results):
-            effective_sort = "speed"
-        if effective_sort == "speed":
-            results.sort(key=lambda r: (r.speed_mbps is None, -(r.speed_mbps or 0)))
-        else:
-            results.sort(key=lambda r: (r.latency_ms is None, r.latency_ms or 999_999))
-
-        st.session_state["results"] = results
+        results = st.session_state["results"] or []
         progress_bar.progress(
             100,
-            text="延迟测试完成！" if test_mode == "latency" else "网速测试完成！",
+            text=(
+                "测试已停止，已保留部分结果。"
+                if st.session_state.get("stop_requested")
+                else ("延迟测试完成！" if test_mode == "latency" else "网速测试完成！")
+            ),
         )
         time.sleep(0.5)
         progress_bar.empty()
@@ -354,35 +421,7 @@ if results is not None and len(results) > 0:
     )
 
     with tab_table:
-        # Build display dataframe
-        display_data = []
-        for idx, r in enumerate(results, 1):
-            display_data.append({
-                "序号": idx,
-                "节点名称": r.name,
-                "代理组": r.group,
-                "延迟 (ms)": r.latency_ms if r.latency_ms is not None else None,
-                "速度 (Mbps)": r.speed_mbps if r.speed_mbps is not None else None,
-                "错误信息": r.error or "",
-            })
-
-        st.dataframe(
-            display_data,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "序号": st.column_config.NumberColumn("序号", width="small"),
-                "节点名称": st.column_config.TextColumn("节点名称", width="medium"),
-                "代理组": st.column_config.TextColumn("代理组", width="medium"),
-                "延迟 (ms)": st.column_config.NumberColumn(
-                    "延迟 (ms)", format="%d", width="small"
-                ),
-                "速度 (Mbps)": st.column_config.NumberColumn(
-                    "速度 (Mbps)", format="%.2f", width="small"
-                ),
-                "错误信息": st.column_config.TextColumn("错误信息", width="large"),
-            },
-        )
+        show_results_dataframe(results)
 
     with tab_latency_chart:
         lat_chart_data = {
