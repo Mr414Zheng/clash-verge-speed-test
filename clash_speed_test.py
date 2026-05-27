@@ -155,14 +155,16 @@ class ClashClient:
         proxies = {"http": proxy_url, "https": proxy_url}
 
         urls_to_try = [url] + [u for u in FALLBACK_SPEED_URLS if u != url]
-        last_exc: Exception | None = None
+        failures: list[str] = []
         for try_url in urls_to_try:
             try:
                 return self._download_and_measure(try_url, proxies)
             except Exception as exc:
-                last_exc = exc
+                failures.append(f"{try_url}: {exc}")
                 continue
-        raise last_exc  # type: ignore[misc]
+        raise RuntimeError(
+            "all speed test URLs failed: " + "; ".join(failures)
+        )
 
     # -- Config --------------------------------------------------------------
     def get_configs(self) -> dict:
@@ -212,15 +214,17 @@ class ClashClient:
 
     def _download_and_measure(self, url: str, proxies: dict) -> float:
         """Download *url* through the given *proxies* dict; return Mbps."""
-        start = time.monotonic()
         state: dict[str, object] = {
             "total_bytes": 0,
             "error": None,
             "resp": None,
             "finished": False,
+            "first_byte_at": None,
         }
         state_lock = threading.Lock()
         stop_download = threading.Event()
+        first_byte_received = threading.Event()
+        download_finished = threading.Event()
 
         def _download_worker() -> None:
             resp: requests.Response | None = None
@@ -228,7 +232,7 @@ class ClashClient:
                 resp = requests.get(
                     url,
                     proxies=proxies,
-                    timeout=min(DEFAULT_SPEED_TIMEOUT, DEFAULT_SPEED_DURATION),
+                    timeout=DEFAULT_SPEED_TIMEOUT,
                     stream=True,
                 )
                 with state_lock:
@@ -240,7 +244,10 @@ class ClashClient:
                     if not chunk:
                         continue
                     with state_lock:
+                        if state["first_byte_at"] is None:
+                            state["first_byte_at"] = time.monotonic()
                         state["total_bytes"] = int(state["total_bytes"]) + len(chunk)
+                    first_byte_received.set()
             except Exception as exc:
                 with state_lock:
                     state["error"] = exc
@@ -249,10 +256,49 @@ class ClashClient:
                     resp.close()
                 with state_lock:
                     state["finished"] = True
+                download_finished.set()
 
         worker = threading.Thread(target=_download_worker, daemon=True)
         worker.start()
-        worker.join(DEFAULT_SPEED_DURATION)
+
+        wait_deadline = time.monotonic() + DEFAULT_SPEED_TIMEOUT
+        while (
+            not first_byte_received.is_set()
+            and not download_finished.is_set()
+            and time.monotonic() < wait_deadline
+        ):
+            time.sleep(0.01)
+
+        with state_lock:
+            total_bytes = int(state["total_bytes"])
+            error = state["error"]
+            resp = state["resp"]
+            finished = bool(state["finished"])
+            first_byte_at = state["first_byte_at"]
+
+        if not first_byte_received.is_set():
+            if not finished:
+                stop_download.set()
+                if resp is not None:
+                    threading.Thread(target=resp.close, daemon=True).start()
+                raise requests.Timeout(
+                    f"speed test timed out before receiving body bytes after "
+                    f"{DEFAULT_SPEED_TIMEOUT} seconds"
+                )
+            if total_bytes == 0 and error is not None:
+                raise error  # type: ignore[misc]
+            raise ValueError("speed test URL returned no body bytes")
+
+        measurement_start = (
+            float(first_byte_at)
+            if first_byte_at is not None
+            else time.monotonic()
+        )
+        remaining = max(
+            0.0,
+            DEFAULT_SPEED_DURATION - (time.monotonic() - measurement_start),
+        )
+        worker.join(remaining)
 
         with state_lock:
             total_bytes = int(state["total_bytes"])
@@ -276,7 +322,7 @@ class ClashClient:
         if total_bytes == 0:
             raise ValueError("speed test URL returned no body bytes")
 
-        elapsed = min(time.monotonic() - start, DEFAULT_SPEED_DURATION)
+        elapsed = min(time.monotonic() - measurement_start, DEFAULT_SPEED_DURATION)
         if elapsed == 0:
             elapsed = 0.001
         mbps = (total_bytes * 8) / (elapsed * 1_000_000)  # megabits per second

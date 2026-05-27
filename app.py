@@ -360,7 +360,7 @@ if st.session_state["test_running"]:
                 completed += 1
                 _publish_result(name, result, "speed")
                 pct = 5 + int((completed / total_nodes) * 90)
-                progress_bar.progress(pct, text=f"网速测试中 ({completed}/{total_nodes}): {name}")
+                progress_bar.progress(pct, text=f"已完成网速测试 ({completed}/{total_nodes}): {name}")
 
         results = st.session_state["results"] or []
         progress_bar.progress(
