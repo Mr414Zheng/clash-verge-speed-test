@@ -20,7 +20,15 @@ def results_to_csv(results: list[NodeResult]) -> str:
     """Convert NodeResult list to a CSV string."""
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["序号", "节点名称", "代理组", "延迟 (ms)", "速度 (Mbps)", "错误信息"])
+    writer.writerow([
+        "序号",
+        "节点名称",
+        "代理组",
+        "延迟 (ms)",
+        "速度 (Mbps)",
+        "风险等级",
+        "错误信息",
+    ])
     for idx, r in enumerate(results, 1):
         writer.writerow([
             idx,
@@ -28,6 +36,7 @@ def results_to_csv(results: list[NodeResult]) -> str:
             r.group,
             r.latency_ms if r.latency_ms is not None else "",
             f"{r.speed_mbps:.2f}" if r.speed_mbps is not None else "",
+            r.risk_level or "",
             r.error or "",
         ])
     return buf.getvalue()
@@ -43,6 +52,7 @@ def build_display_data(results: list[NodeResult]) -> list[dict]:
             "代理组": r.group,
             "延迟 (ms)": r.latency_ms if r.latency_ms is not None else None,
             "速度 (Mbps)": r.speed_mbps if r.speed_mbps is not None else None,
+            "风险等级": r.risk_level or "",
             "错误信息": r.error or "",
         })
     return display_data
