@@ -18,6 +18,12 @@ class SpeedClient(Protocol):
         ...
 
 
+def build_proxy_config(client: SpeedClient) -> dict[str, str]:
+    """Return requests proxy config for the active local Clash HTTP proxy."""
+    proxy_url = f"http://127.0.0.1:{client.get_proxy_port()}"
+    return {"http": proxy_url, "https": proxy_url}
+
+
 def test_download_speed(client: SpeedClient, proxy_name: str, url: str) -> float:
     """Download *url* through *proxy_name* and return speed in Mbps.
 
@@ -25,8 +31,7 @@ def test_download_speed(client: SpeedClient, proxy_name: str, url: str) -> float
     succeeds. Raises only if all URLs fail.
     """
     del proxy_name
-    proxy_url = f"http://127.0.0.1:{client.get_proxy_port()}"
-    proxies = {"http": proxy_url, "https": proxy_url}
+    proxies = build_proxy_config(client)
 
     urls_to_try = [url] + [u for u in FALLBACK_SPEED_URLS if u != url]
     failures: list[str] = []

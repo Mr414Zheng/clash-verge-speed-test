@@ -62,26 +62,35 @@ def _print_rich(results: list[NodeResult]) -> None:
     table.add_column("Group", style="magenta")
     table.add_column("Latency (ms)", justify="right")
     table.add_column("Speed (Mbps)", justify="right")
+    table.add_column("Risk", justify="center")
     table.add_column("Error", style="red")
 
     for idx, r in enumerate(results, 1):
         lat = str(r.latency_ms) if r.latency_ms is not None else "-"
         spd = f"{r.speed_mbps:.2f}" if r.speed_mbps is not None else "-"
+        risk = r.risk_level or "-"
         err = r.error or ""
-        table.add_row(str(idx), r.name, r.group, lat, spd, err)
+        table.add_row(str(idx), r.name, r.group, lat, spd, risk, err)
 
     console.print(table)
 
 
 def _print_plain(results: list[NodeResult]) -> None:
-    header = f"{'#':>4}  {'Proxy':<30} {'Group':<20} {'Latency(ms)':>12} {'Speed(Mbps)':>12}  {'Error'}"
+    header = (
+        f"{'#':>4}  {'Proxy':<30} {'Group':<20} {'Latency(ms)':>12} "
+        f"{'Speed(Mbps)':>12} {'Risk':>10}  {'Error'}"
+    )
     print(header)
     print("-" * len(header))
     for idx, r in enumerate(results, 1):
         lat = str(r.latency_ms) if r.latency_ms is not None else "-"
         spd = f"{r.speed_mbps:.2f}" if r.speed_mbps is not None else "-"
+        risk = r.risk_level or "-"
         err = r.error or ""
-        print(f"{idx:>4}  {r.name:<30} {r.group:<20} {lat:>12} {spd:>12}  {err}")
+        print(
+            f"{idx:>4}  {r.name:<30} {r.group:<20} {lat:>12} "
+            f"{spd:>12} {risk:>10}  {err}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,7 +206,7 @@ def main() -> None:
     print("Running latency tests...")
     latency_map = run_latency_tests(client, proxies, args.latency_url)
 
-    speed_map: dict[str, tuple[float | None, str | None]] = {}
+    speed_map: dict[str, tuple[float | None, str | None, str | None]] = {}
     if not args.skip_speed:
         proxy_port = client.get_proxy_port()
         print(
@@ -211,7 +220,7 @@ def main() -> None:
     results: list[NodeResult] = []
     for group, name in proxies:
         lat, lat_err = latency_map.get(name, (None, None))
-        spd, spd_err = speed_map.get(name, (None, None))
+        spd, risk, spd_err = speed_map.get(name, (None, None, None))
 
         errors: list[str] = []
         if lat_err:
@@ -224,6 +233,7 @@ def main() -> None:
             group=group,
             latency_ms=lat,
             speed_mbps=spd,
+            risk_level=risk,
             error="; ".join(errors) if errors else None,
         )
         results.append(node)

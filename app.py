@@ -120,6 +120,7 @@ def show_results_dataframe(results: list[NodeResult]) -> None:
             "速度 (Mbps)": st.column_config.NumberColumn(
                 "速度 (Mbps)", format="%.2f", width="small"
             ),
+            "风险等级": st.column_config.TextColumn("风险等级", width="small"),
             "错误信息": st.column_config.TextColumn("错误信息", width="large"),
         },
     )
@@ -148,21 +149,21 @@ latency_col, speed_col, stop_col, status_col = st.columns([1, 1, 1, 2])
 
 with latency_col:
     latency_clicked = st.button(
-        "延迟测试",
+        "⏱️ 延迟测试",
         disabled=st.session_state["test_running"],
         use_container_width=True,
     )
 
 with speed_col:
     speed_clicked = st.button(
-        "网速测试",
+        "⬇️ 网速测试",
         disabled=st.session_state["test_running"],
         use_container_width=True,
     )
 
 with stop_col:
     stop_clicked = st.button(
-        "停止测试",
+        "⏹️ 停止测试",
         disabled=not st.session_state["test_running"],
         use_container_width=True,
     )
@@ -262,13 +263,15 @@ if st.session_state["test_running"]:
                 name=name,
                 group=group_by_name.get(name, ""),
             )
-            value, error = result
             if mode == "latency":
+                value, error = result
                 node.latency_ms = value
                 if error:
                     node.error = error
             else:
+                value, risk_level, error = result
                 node.speed_mbps = value
+                node.risk_level = risk_level
                 if error:
                     node.error = error
             result_by_name[name] = node

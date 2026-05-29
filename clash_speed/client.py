@@ -35,6 +35,24 @@ class ClashClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_selected_proxy(self, group_name: str) -> str | None:
+        """Return the currently selected proxy for a selector group."""
+        return self.get_selected_proxies([group_name]).get(group_name)
+
+    def get_selected_proxies(self, group_names: list[str]) -> dict[str, str]:
+        """Return current selections for the requested selector groups."""
+        wanted = set(group_names)
+        data = self.get_proxies()
+        proxies_section = data.get("proxies", {})
+        selected: dict[str, str] = {}
+        for group_name, group_info in proxies_section.items():
+            if group_name not in wanted:
+                continue
+            current = group_info.get("now")
+            if isinstance(current, str) and current:
+                selected[group_name] = current
+        return selected
+
     def list_proxy_names(self) -> list[tuple[str, str]]:
         """Return [(group_name, proxy_name), ...] for all leaf proxies.
 
