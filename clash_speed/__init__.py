@@ -1,12 +1,7 @@
-"""
-Clash Verge Proxy Speed Tester
+"""Public API for the Clash Verge speed tester package."""
 
-Compatibility wrapper for the CLI and historical imports. The implementation
-now lives in the ``clash_speed`` package.
-"""
-
-from clash_speed import (
-    ClashClient,
+from .client import ClashClient
+from .defaults import (
     DEFAULT_API_URL,
     DEFAULT_LATENCY_TIMEOUT,
     DEFAULT_LATENCY_URL,
@@ -16,19 +11,17 @@ from clash_speed import (
     DEFAULT_TIMEOUT,
     DEFAULT_WORKERS,
     FALLBACK_SPEED_URLS,
-    NodeResult,
     PROXY_PORT_FALLBACKS,
+)
+from .models import NodeResult
+from .results import build_display_data, results_to_csv, sort_results
+from .runners import (
     StopChecker,
-    build_display_data,
     iter_latency_tests,
     iter_speed_tests,
-    results_to_csv,
     run_latency_tests,
     run_speed_tests,
-    sort_results,
 )
-from clash_speed.cli import HAS_RICH, main, parse_args, print_results
-from clash_speed.speed import download_and_measure
 
 __all__ = [
     "ClashClient",
@@ -41,23 +34,14 @@ __all__ = [
     "DEFAULT_TIMEOUT",
     "DEFAULT_WORKERS",
     "FALLBACK_SPEED_URLS",
-    "HAS_RICH",
     "NodeResult",
     "PROXY_PORT_FALLBACKS",
     "StopChecker",
     "build_display_data",
-    "download_and_measure",
     "iter_latency_tests",
     "iter_speed_tests",
-    "main",
-    "parse_args",
-    "print_results",
     "results_to_csv",
     "run_latency_tests",
     "run_speed_tests",
     "sort_results",
 ]
-
-
-if __name__ == "__main__":
-    main()
