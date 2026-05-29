@@ -27,8 +27,9 @@ python -c "import py_compile; py_compile.compile('app.py', doraise=True)"
 
 ## Architecture
 
-- **`clash_speed_test.py`** — Core business logic + CLI. Contains `ClashClient` (API wrapper), `NodeResult` (data model), `run_latency_tests()`, `run_speed_tests()`, and CLI entry point. This is the single source of truth for all Clash API interactions.
-- **`app.py`** — Streamlit web UI. Imports and reuses all business logic from `clash_speed_test.py`. Does NOT duplicate any API/testing logic.
+- **`clash_speed/`** — Core package. Contains defaults, `NodeResult`, `ClashClient`, HTTP speed measurement, latency/speed runners, pure result conversion helpers, and CLI output/argument handling.
+- **`clash_speed_test.py`** — Backward-compatible thin shim and CLI script entry point. Re-exports the package public API so old imports keep working.
+- **`app.py`** — Streamlit web UI. Imports and reuses business logic and result conversion helpers from `clash_speed`. Does NOT duplicate any API/testing logic.
 - **`requirements.txt`** — Dependencies: requests, rich, streamlit.
 
 ## Key Design Decisions
